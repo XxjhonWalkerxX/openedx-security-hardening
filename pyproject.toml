@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openedx-security-hardening"
+version = "1.0.0"
+description = "Open edX plugin: hardening fixes for vulnerabilities reported by TICDEFENSE Cybersecurity (04-may-2026) — Cursos @prende.mx"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "EMI / Cursos @prende.mx", email = "soporte@aprende.gob.mx" }]
+keywords = ["open edx", "tutor", "security", "hardening", "lockout"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Security",
+]
+dependencies = [
+    "Django>=3.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/aprendemx/openedx-security-hardening"
+Issues   = "https://github.com/aprendemx/openedx-security-hardening/issues"
+
+# Registra el AppConfig en el LMS (para el monkey-patch de mass assignment #3)
+[project.entry-points."lms.djangoapp"]
+security_hardening = "security_hardening.apps:SecurityHardeningConfig"
+
+# Registra el plugin Tutor (para settings de lockout #1 y override de admin_fields #4)
+[project.entry-points."tutor.plugin.v1"]
+security_hardening = "security_hardening.tutor_plugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["security_hardening*"]
