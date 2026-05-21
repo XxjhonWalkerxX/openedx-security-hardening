@@ -27,6 +27,9 @@ hooks.Filters.CONFIG_DEFAULTS.add_items([
     ("SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS", 5),
     ("SECURITY_HARDENING_LOCKOUT_PERIOD_SECS",       1800),   # 30 minutos
     ("SECURITY_HARDENING_REMOVE_ACTIVATION_KEY",     True),
+    # django-axes: cubre el endpoint /oauth2/access_token (password grant)
+    # que LoginFailures de Open edX upstream NO cubre.
+    ("SECURITY_HARDENING_AXES_ENABLED",              True),
 ])
 
 
@@ -40,15 +43,42 @@ hooks.Filters.ENV_PATCHES.add_item((
 # ============================================================
 
 # --------------------------------------------------------------
-# Vulnerabilidad #1 - Weak Lock Out Mechanism
+# Vulnerabilidad #1 - Weak Lock Out Mechanism (parte A: login web)
 # --------------------------------------------------------------
 # Activa el mecanismo nativo LoginFailures de Open edX que bloquea
-# temporalmente cuentas tras N intentos fallidos consecutivos.
-# Tras alcanzar el umbral, los intentos siguientes devuelven HTTP 403
-# con error 'user_locked_out' aunque la contrasena sea correcta.
+# temporalmente cuentas tras N intentos fallidos consecutivos en el
+# login web/MFE (/login_ajax). Tras alcanzar el umbral, los intentos
+# siguientes devuelven HTTP 403 con error 'user_locked_out' aunque la
+# contrasena sea correcta.
 FEATURES["ENABLE_MAX_FAILED_LOGIN_ATTEMPTS"] = True
 MAX_FAILED_LOGIN_ATTEMPTS_ALLOWED = {{ SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS }}
 MAX_FAILED_LOGIN_ATTEMPTS_LOCKOUT_PERIOD_SECS = {{ SECURITY_HARDENING_LOCKOUT_PERIOD_SECS }}
+
+# --------------------------------------------------------------
+# Vulnerabilidad #1 - Weak Lock Out Mechanism (parte B: OAuth2)
+# --------------------------------------------------------------
+# LoginFailures de Open edX NO cubre el endpoint /oauth2/access_token
+# (password grant) que usa la app movil. django-axes hookea a las
+# signals de Django auth (user_login_failed / user_logged_in) por lo
+# que intercepta TODOS los flujos de autenticacion: web, OAuth2 password
+# grant, social auth, etc.
+{% if SECURITY_HARDENING_AXES_ENABLED -%}
+INSTALLED_APPS.append("axes")
+
+MIDDLEWARE.append("axes.middleware.AxesMiddleware")
+
+# AxesStandaloneBackend debe ir al inicio para que intercepte primero.
+AUTHENTICATION_BACKENDS = ["axes.backends.AxesStandaloneBackend"] + list(AUTHENTICATION_BACKENDS)
+
+# Parametros de bloqueo
+AXES_FAILURE_LIMIT       = {{ SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS }}
+AXES_COOLOFF_TIME        = {{ SECURITY_HARDENING_LOCKOUT_PERIOD_SECS }} / 3600.0   # axes espera horas
+AXES_LOCKOUT_PARAMETERS  = ["username"]    # bloquea por username (no por IP, que es de CDN)
+AXES_RESET_ON_SUCCESS    = True            # login exitoso resetea contador
+AXES_LOCKOUT_CALLABLE    = None            # usa default (403 con JSON)
+AXES_DISABLE_ACCESS_LOG  = False           # mantiene audit trail en BD
+AXES_ENABLE_ADMIN        = True            # ver intentos desde Django admin
+{%- endif %}
 
 # --------------------------------------------------------------
 # Vulnerabilidad #4 - Activacion de cuentas sin necesidad de correo

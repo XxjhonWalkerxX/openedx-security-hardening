@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "Django>=3.2",
+    "django-axes>=6.0.0",
 ]
 
 [project.urls]

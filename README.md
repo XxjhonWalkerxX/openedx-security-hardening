@@ -6,7 +6,7 @@ Plugin de Open edX (Tutor v21+) que aplica medidas de hardening en respuesta al 
 
 | # | Vulnerabilidad del dictamen | Severidad | Mecanismo aplicado |
 |---|---|---|---|
-| 1 | Weak Lock Out Mechanism | Medio | `FEATURES["ENABLE_MAX_FAILED_LOGIN_ATTEMPTS"]` + `MAX_FAILED_LOGIN_ATTEMPTS_ALLOWED=5` + lockout 30 min |
+| 1 | Weak Lock Out Mechanism | Medio | (a) `LoginFailures` upstream para login web `/login_ajax`; (b) `django-axes` para OAuth2 password grant `/oauth2/access_token`. Ambos: 5 intentos / 30 min lockout |
 | 3 | Asignación masiva de parámetros (defensa profundidad) | Medio (falso positivo según verificación) | Monkey-patch a `update_account_settings` con allowlist explícito |
 | 4 | Activación de cuentas sin necesidad de correo | Medio | Override de `ACCOUNT_VISIBILITY_CONFIGURATION["admin_fields"]` para remover `activation_key` y `pending_name_change` |
 
