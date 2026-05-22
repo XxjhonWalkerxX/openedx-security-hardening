@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openedx-security-hardening"
-version = "1.0.4"
+version = "1.0.5"
 description = "Open edX plugin: hardening fixes for vulnerabilities reported by TICDEFENSE Cybersecurity (04-may-2026) — Cursos @prende.mx"
 readme = "README.md"
 requires-python = ">=3.8"

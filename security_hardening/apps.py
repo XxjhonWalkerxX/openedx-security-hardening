@@ -151,8 +151,8 @@ class SecurityHardeningConfig(AppConfig):
 
         try:
             from django.conf import settings
-            from django.utils.decorators import method_decorator
-            from django_ratelimit.decorators import ratelimit
+            from django.http import JsonResponse
+            from django_ratelimit.core import is_ratelimited
             from openedx.core.djangoapps.oauth_dispatch import views as oauth_views
         except ImportError as exc:
             logger.warning(
@@ -177,19 +177,50 @@ class SecurityHardeningConfig(AppConfig):
             SecurityHardeningConfig._patched_oauth2 = True
             return
 
-        # IMPORTANTE: usamos method_decorator porque @ratelimit espera `request`
-        # como primer argumento posicional. dispatch de una clase recibe (self,
-        # request, ...) - sin method_decorator, ratelimit confunde `self` con
-        # `request`, no encuentra `.POST` y el throttle pasa silenciosamente.
-        # Open edX usa el mismo patron en el view original (key='real_ip').
-        patched_dispatch = method_decorator(
-            ratelimit(
-                key="post:username",
-                rate=rate,
-                method="POST",
-                block=True,
-            )
-        )(original_dispatch)
+        # En lugar de usar @ratelimit como decorador (que espera `request` como
+        # primer argumento y se rompe cuando se aplica a un metodo de clase
+        # que ya esta envuelto por otro method_decorator de Open edX), llamamos
+        # directamente a is_ratelimited() dentro del wrapper. Asi controlamos
+        # exactamente que objeto se pasa al rate-limiter y evitamos confusion
+        # entre `self` y `request`.
+        def patched_dispatch(self, request, *args, **kwargs):
+            if request.method == "POST":
+                try:
+                    ratelimited = is_ratelimited(
+                        request=request,
+                        group="security_hardening.oauth2_user",
+                        fn=patched_dispatch,
+                        key="post:username",
+                        rate=rate,
+                        method="POST",
+                        increment=True,
+                    )
+                except Exception:
+                    # No bloquees el login legitimo si el rate-limit falla.
+                    logger.exception(
+                        "[SecurityHardening] Error en is_ratelimited - fallback a permitir"
+                    )
+                    ratelimited = False
+
+                if ratelimited:
+                    username = request.POST.get("username", "")
+                    logger.warning(
+                        "[SecurityHardening] /oauth2/access_token rate-limited "
+                        "username=%s rate=%s",
+                        username,
+                        rate,
+                    )
+                    return JsonResponse(
+                        {
+                            "error": "too_many_attempts",
+                            "error_description": (
+                                "Demasiados intentos fallidos de inicio de sesion. "
+                                "Intente de nuevo en unos minutos."
+                            ),
+                        },
+                        status=429,
+                    )
+            return original_dispatch(self, request, *args, **kwargs)
 
         patched_dispatch._security_hardening_patched = True
         target_cls.dispatch = patched_dispatch
