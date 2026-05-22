@@ -2,16 +2,21 @@
 Tutor plugin para openedx-security-hardening.
 
 Inyecta settings de Django en el LMS para cerrar:
-  #1 Weak Lock Out Mechanism: activa LoginFailures de Open edX upstream
+  #1 Weak Lock Out Mechanism:
+     (a) LoginFailures de Open edX upstream (login web /login_ajax)
+     (b) RATELIMIT_RATE global mas estricto + ratelimit por username en
+         /oauth2/access_token aplicado via monkey-patch en apps.py
   #4 Activation key exposure: quita el campo de admin_fields
-       (solo es necesario en Tutor < 21.0.4 — en versiones >= 21.0.4 el
+       (solo es necesario en Tutor < 21.0.4 - en versiones >= 21.0.4 el
        fix esta upstream pero el override es idempotente)
 
 Configurar opcionalmente con:
 
-    tutor config save \
-      --set SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS=5 \
-      --set SECURITY_HARDENING_LOCKOUT_PERIOD_SECS=1800
+    tutor config save \\
+      --set SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS=5 \\
+      --set SECURITY_HARDENING_LOCKOUT_PERIOD_SECS=1800 \\
+      --set SECURITY_HARDENING_GLOBAL_RATELIMIT="30/m" \\
+      --set SECURITY_HARDENING_OAUTH2_USER_RATELIMIT="5/30m"
 
     tutor local restart lms
 
@@ -19,6 +24,13 @@ Para deshabilitar el plugin:
 
     tutor plugins disable security_hardening
     tutor local restart lms
+
+Nota historica: la version 1.0.0/1.0.1 de este plugin usaba django-axes
+para cubrir el endpoint /oauth2/access_token. Se removio en 1.0.2 porque
+AxesStandaloneBackend.authenticate() exige `request` y django-oauth-toolkit
+no lo pasa en el password grant -> HTTP 500. Ahora se usa django-ratelimit
+(que ya esta integrado en oauth_dispatch/views.py de Open edX) con un
+ratelimit adicional por username via monkey-patch.
 """
 from tutor import hooks
 
@@ -27,9 +39,15 @@ hooks.Filters.CONFIG_DEFAULTS.add_items([
     ("SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS", 5),
     ("SECURITY_HARDENING_LOCKOUT_PERIOD_SECS",       1800),   # 30 minutos
     ("SECURITY_HARDENING_REMOVE_ACTIVATION_KEY",     True),
-    # django-axes: cubre el endpoint /oauth2/access_token (password grant)
-    # que LoginFailures de Open edX upstream NO cubre.
-    ("SECURITY_HARDENING_AXES_ENABLED",              True),
+    # Rate limit global (por IP) aplicado a todos los endpoints API
+    # protegidos con @ratelimit en Open edX. Default Open edX = "120/m".
+    # Lo bajamos para limitar fuerza bruta desde una sola IP.
+    ("SECURITY_HARDENING_GLOBAL_RATELIMIT",          "30/m"),
+    # Rate limit especifico por username para /oauth2/access_token.
+    # Aplicado via monkey-patch en apps.py. Esto cierra el gap del
+    # dictamen #1 (Weak Lock Out) para la app movil que NO pasa por
+    # /login_ajax sino por el OAuth2 password grant.
+    ("SECURITY_HARDENING_OAUTH2_USER_RATELIMIT",     "5/30m"),
 ])
 
 
@@ -57,28 +75,18 @@ MAX_FAILED_LOGIN_ATTEMPTS_LOCKOUT_PERIOD_SECS = {{ SECURITY_HARDENING_LOCKOUT_PE
 # --------------------------------------------------------------
 # Vulnerabilidad #1 - Weak Lock Out Mechanism (parte B: OAuth2)
 # --------------------------------------------------------------
-# LoginFailures de Open edX NO cubre el endpoint /oauth2/access_token
-# (password grant) que usa la app movil. django-axes hookea a las
-# signals de Django auth (user_login_failed / user_logged_in) por lo
-# que intercepta TODOS los flujos de autenticacion: web, OAuth2 password
-# grant, social auth, etc.
-{% if SECURITY_HARDENING_AXES_ENABLED -%}
-INSTALLED_APPS.append("axes")
-
-MIDDLEWARE.append("axes.middleware.AxesMiddleware")
-
-# AxesStandaloneBackend debe ir al inicio para que intercepte primero.
-AUTHENTICATION_BACKENDS = ["axes.backends.AxesStandaloneBackend"] + list(AUTHENTICATION_BACKENDS)
-
-# Parametros de bloqueo
-AXES_FAILURE_LIMIT       = {{ SECURITY_HARDENING_MAX_FAILED_LOGIN_ATTEMPTS }}
-AXES_COOLOFF_TIME        = {{ SECURITY_HARDENING_LOCKOUT_PERIOD_SECS }} / 3600.0   # axes espera horas
-AXES_LOCKOUT_PARAMETERS  = ["username"]    # bloquea por username (no por IP, que es de CDN)
-AXES_RESET_ON_SUCCESS    = True            # login exitoso resetea contador
-AXES_LOCKOUT_CALLABLE    = None            # usa default (403 con JSON)
-AXES_DISABLE_ACCESS_LOG  = False           # mantiene audit trail en BD
-AXES_ENABLE_ADMIN        = True            # ver intentos desde Django admin
-{%- endif %}
+# El endpoint /oauth2/access_token (password grant) usado por la app
+# movil NO pasa por LoginFailures. En su lugar:
+#   1. Open edX ya tiene @ratelimit(key='real_ip', rate=RATELIMIT_RATE)
+#      en oauth_dispatch/views.py:AccessTokenView. Bajamos el rate
+#      global desde 120/m (default Open edX) a 30/m para limitar
+#      fuerza bruta desde una sola IP.
+#   2. Adicionalmente, apps.py aplica un @ratelimit por username via
+#      monkey-patch sobre el mismo view. Esto evita evasion via rotacion
+#      de IPs (proxies, datos moviles, etc.).
+RATELIMIT_ENABLE = True
+RATELIMIT_RATE   = "{{ SECURITY_HARDENING_GLOBAL_RATELIMIT }}"
+SECURITY_HARDENING_OAUTH2_USER_RATELIMIT = "{{ SECURITY_HARDENING_OAUTH2_USER_RATELIMIT }}"
 
 # --------------------------------------------------------------
 # Vulnerabilidad #4 - Activacion de cuentas sin necesidad de correo
@@ -101,9 +109,8 @@ ACCOUNT_VISIBILITY_CONFIGURATION["admin_fields"] = [
 
 # --------------------------------------------------------------
 # Logger para los warnings del monkey-patch de mass assignment (#3)
+# y para los avisos del patch de oauth2 ratelimit (#1)
 # --------------------------------------------------------------
-# El AppConfig SecurityHardeningConfig escribe a este logger cada vez
-# que detecta un PATCH que intenta modificar campos fuera del allowlist.
 LOGGING['loggers'].setdefault('security_hardening', {
     'handlers': ['console'],
     'level':    'INFO',

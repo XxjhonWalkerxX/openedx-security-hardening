@@ -1,14 +1,17 @@
 """
-AppConfig que aplica el monkey-patch a `update_account_settings` para
-implementar defensa en profundidad contra mass assignment (#3 del
-dictamen TICDEFENSE).
+AppConfig que aplica los monkey-patches del plugin de hardening:
+
+1. Patch a `update_account_settings` para defensa en profundidad contra
+   mass assignment (#3 del dictamen TICDEFENSE).
+2. Patch a `AccessTokenView.dispatch` para agregar un rate-limit por
+   username en /oauth2/access_token (#1 del dictamen, parte OAuth2).
 
 Notas:
 - Open edX upstream YA bloquea campos del sistema (is_staff, is_superuser,
   id, username, is_active, date_joined). Este plugin agrega una capa extra
   con un allowlist explicito de campos editables.
-- El patch solo aplica a usuarios NO staff/superuser. Los admins conservan
-  su capacidad completa de modificar cualquier campo.
+- El patch de mass assignment solo aplica a usuarios NO staff/superuser.
+  Los admins conservan su capacidad completa de modificar cualquier campo.
 - Intentos rechazados se registran en log para evidencia/auditoria.
 """
 import logging
@@ -48,11 +51,12 @@ ALLOWED_PROFILE_FIELDS = frozenset({
 
 class SecurityHardeningConfig(AppConfig):
     """
-    AppConfig que aplica el patch al cargar el LMS.
+    AppConfig que aplica los patches al cargar el LMS.
     """
     name = "security_hardening"
     verbose_name = "Open edX Security Hardening"
-    _patched = False
+    _patched_account = False
+    _patched_oauth2 = False
 
     def ready(self):
         try:
@@ -61,6 +65,12 @@ class SecurityHardeningConfig(AppConfig):
             logger.exception(
                 "[SecurityHardening] Error al aplicar patch de update_account_settings"
             )
+        try:
+            self._patch_oauth2_username_ratelimit()
+        except Exception:
+            logger.exception(
+                "[SecurityHardening] Error al aplicar patch de oauth2 ratelimit"
+            )
 
     def _patch_update_account_settings(self):
         """
@@ -68,7 +78,7 @@ class SecurityHardeningConfig(AppConfig):
         por una version que filtra el payload con `ALLOWED_PROFILE_FIELDS` cuando
         el requesting_user no tiene privilegios de staff/superuser.
         """
-        if SecurityHardeningConfig._patched:
+        if SecurityHardeningConfig._patched_account:
             return
 
         try:
@@ -117,9 +127,64 @@ class SecurityHardeningConfig(AppConfig):
             return original_update(requesting_user, update_data, username=username)
 
         accounts_api.update_account_settings = safe_update_account_settings
-        SecurityHardeningConfig._patched = True
+        SecurityHardeningConfig._patched_account = True
         logger.info(
             "[SecurityHardening] Patch aplicado a update_account_settings. "
             "Campos permitidos para usuarios no-staff: %s",
             sorted(ALLOWED_PROFILE_FIELDS),
+        )
+
+    def _patch_oauth2_username_ratelimit(self):
+        """
+        Envuelve `openedx.core.djangoapps.oauth_dispatch.views.AccessTokenView.dispatch`
+        con un @ratelimit adicional con `key="post:username"`. Esto cierra el gap del
+        dictamen #1 (Weak Lock Out) para el endpoint /oauth2/access_token usado por la
+        app movil (OAuth2 password grant).
+
+        Open edX upstream ya aplica @ratelimit con key='real_ip' en este view; eso
+        limita fuerza bruta desde una sola IP pero NO desde un atacante que rote IPs
+        (proxies, redes moviles, etc.). El ratelimit por username aplica el lockout
+        sobre el usuario victima sin importar desde donde venga.
+        """
+        if SecurityHardeningConfig._patched_oauth2:
+            return
+
+        try:
+            from django.conf import settings
+            from django_ratelimit.decorators import ratelimit
+            from openedx.core.djangoapps.oauth_dispatch import views as oauth_views
+        except ImportError as exc:
+            logger.warning(
+                "[SecurityHardening] No se pudo importar dependencias para "
+                "oauth2 ratelimit: %s - patch NO aplicado",
+                exc,
+            )
+            return
+
+        target_cls = getattr(oauth_views, "AccessTokenView", None)
+        if target_cls is None:
+            logger.warning(
+                "[SecurityHardening] AccessTokenView no encontrada en oauth_dispatch.views "
+                "- patch oauth2 ratelimit NO aplicado"
+            )
+            return
+
+        rate = getattr(settings, "SECURITY_HARDENING_OAUTH2_USER_RATELIMIT", "5/30m")
+        original_dispatch = target_cls.dispatch
+
+        if getattr(original_dispatch, "_security_hardening_patched", False):
+            SecurityHardeningConfig._patched_oauth2 = True
+            return
+
+        @ratelimit(key="post:username", rate=rate, method="POST", block=True)
+        def patched_dispatch(self, request, *args, **kwargs):
+            return original_dispatch(self, request, *args, **kwargs)
+
+        patched_dispatch._security_hardening_patched = True
+        target_cls.dispatch = patched_dispatch
+        SecurityHardeningConfig._patched_oauth2 = True
+        logger.info(
+            "[SecurityHardening] Rate-limit por username aplicado a "
+            "/oauth2/access_token: %s",
+            rate,
         )

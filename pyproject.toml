@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openedx-security-hardening"
-version = "1.0.1"
+version = "1.0.2"
 description = "Open edX plugin: hardening fixes for vulnerabilities reported by TICDEFENSE Cybersecurity (04-may-2026) — Cursos @prende.mx"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "EMI / Cursos @prende.mx", email = "soporte@aprende.gob.mx" }]
-keywords = ["open edx", "tutor", "security", "hardening", "lockout"]
+keywords = ["open edx", "tutor", "security", "hardening", "lockout", "ratelimit"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Django",
@@ -24,7 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "Django>=3.2",
-    "django-axes>=6.0.0",
+    "django-ratelimit>=4.0.0",
 ]
 
 [project.urls]
