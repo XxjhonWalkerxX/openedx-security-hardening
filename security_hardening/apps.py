@@ -151,6 +151,7 @@ class SecurityHardeningConfig(AppConfig):
 
         try:
             from django.conf import settings
+            from django.utils.decorators import method_decorator
             from django_ratelimit.decorators import ratelimit
             from openedx.core.djangoapps.oauth_dispatch import views as oauth_views
         except ImportError as exc:
@@ -176,9 +177,19 @@ class SecurityHardeningConfig(AppConfig):
             SecurityHardeningConfig._patched_oauth2 = True
             return
 
-        @ratelimit(key="post:username", rate=rate, method="POST", block=True)
-        def patched_dispatch(self, request, *args, **kwargs):
-            return original_dispatch(self, request, *args, **kwargs)
+        # IMPORTANTE: usamos method_decorator porque @ratelimit espera `request`
+        # como primer argumento posicional. dispatch de una clase recibe (self,
+        # request, ...) - sin method_decorator, ratelimit confunde `self` con
+        # `request`, no encuentra `.POST` y el throttle pasa silenciosamente.
+        # Open edX usa el mismo patron en el view original (key='real_ip').
+        patched_dispatch = method_decorator(
+            ratelimit(
+                key="post:username",
+                rate=rate,
+                method="POST",
+                block=True,
+            )
+        )(original_dispatch)
 
         patched_dispatch._security_hardening_patched = True
         target_cls.dispatch = patched_dispatch
