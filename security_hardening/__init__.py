@@ -22,4 +22,4 @@ Vulnerabilidades NO cubiertas por este plugin:
                               bucket MinIO/S3 que sirve los archivos
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"

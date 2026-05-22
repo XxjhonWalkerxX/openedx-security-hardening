@@ -61,6 +61,18 @@ hooks.Filters.ENV_PATCHES.add_item((
 # ============================================================
 
 # --------------------------------------------------------------
+# Registro del AppConfig en INSTALLED_APPS
+# --------------------------------------------------------------
+# Lo agregamos explicitamente en vez de depender del entry-point
+# lms.djangoapp (que en algunos forks de Open edX no se descubre
+# automaticamente desde paquetes pip-instalados). Esto garantiza
+# que SecurityHardeningConfig.ready() corra al arranque del LMS
+# y aplique los monkey-patches de mass assignment (#3) y de
+# oauth2 ratelimit (#1).
+if "security_hardening" not in INSTALLED_APPS:
+    INSTALLED_APPS.append("security_hardening.apps.SecurityHardeningConfig")
+
+# --------------------------------------------------------------
 # Vulnerabilidad #1 - Weak Lock Out Mechanism (parte A: login web)
 # --------------------------------------------------------------
 # Activa el mecanismo nativo LoginFailures de Open edX que bloquea
