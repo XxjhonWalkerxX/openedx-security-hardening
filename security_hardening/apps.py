@@ -5,9 +5,11 @@ AppConfig que aplica los monkey-patches del plugin de hardening:
    mass assignment (#3 del dictamen TICDEFENSE).
 2. Patch a `AccessTokenView.dispatch` para agregar un rate-limit por
    username en /oauth2/access_token (#1 del dictamen, parte OAuth2).
-3. Patch a `_get_profile_image_urls` para quitar el cache-buster `v` de
-   las URLs de foto de perfil ya firmadas (S3v4), que rompia la firma
-   contra MinIO (#5 del dictamen, Camino A: bucket privado).
+3. Patch a `_get_profile_image_urls` para mover el cache-buster `v` de
+   las URLs de foto de perfil ya firmadas (S3v4) a un fragmento `#v=`,
+   que rompia la firma contra MinIO si iba en el query (#5 del dictamen,
+   Camino A: bucket privado). El fragmento no se envia al servidor pero
+   el cliente lo usa para invalidar su cache al cambiar la foto.
 
 Notas:
 - Open edX upstream YA bloquea campos del sistema (is_staff, is_superuser,
@@ -33,27 +35,42 @@ logger = logging.getLogger(__name__)
 # poda el query no firmado antes de validar, pero MinIO no -> recalcula la firma
 # incluyendo `v` -> SignatureDoesNotMatch -> HTTP 403 en todos los clientes.
 #
-# Estas regex eliminan SOLO el parametro `v`, preservando el resto del query
-# string byte-a-byte (sin re-encodear los `X-Amz-*`, para no invalidar la firma).
+# NO basta con borrar el `v`: el nombre del objeto en Open edX es estable por
+# usuario (`<hash>_<size>.jpg`), asi que sin un token que cambie al subir una
+# foto nueva, los clientes (la app Android con Coil, sobre todo) mostrarian la
+# foto vieja cacheada. Por eso MOVEMOS el `v` del query a un FRAGMENTO (#v=...):
+# el fragmento no viaja en la peticion HTTP (MinIO valida la firma sin el extra),
+# pero el cliente SI lo ve en la URL y lo usa como cache-buster.
+#
+# Estas regex quitan el `v` del query preservando el resto byte-a-byte (sin
+# re-encodear los `X-Amz-*`, para no invalidar la firma).
+_V_PARAM_VALUE_RE = re.compile(r"[?&]v=([^&#]*)")
 _V_PARAM_NOT_FIRST = re.compile(r"&v=[^&]*")
 _V_PARAM_FIRST_WITH_REST = re.compile(r"\?v=[^&]*&")
 _V_PARAM_FIRST_ALONE = re.compile(r"\?v=[^&]*$")
 
 
-def _strip_version_param_if_signed(url):
+def _relocate_version_to_fragment_if_signed(url):
     """
-    Elimina el parametro `v` de una URL SOLO si ya viene firmada (contiene
-    `X-Amz-Signature`). Las URLs no firmadas (bucket publico) se devuelven
-    intactas, conservando su cache-buster.
+    En URLs ya firmadas (contienen `X-Amz-Signature`), MUEVE el cache-buster `v`
+    del query a un fragmento `#v=...`. MinIO valida la firma sin el parametro
+    extra (el fragmento no se envia en la peticion) y el cliente conserva el
+    token para invalidar su cache al cambiar la foto. Las URLs no firmadas
+    (bucket publico) se devuelven intactas, con su `?v=` original.
     """
     if not isinstance(url, str) or "X-Amz-Signature" not in url:
         return url
-    # Caso real: `...&v=123` (v agregado al final, tras los X-Amz-*).
-    url = _V_PARAM_NOT_FIRST.sub("", url)
-    # Casos defensivos por si `v` quedara como primer parametro del query.
-    url = _V_PARAM_FIRST_WITH_REST.sub("?", url)
-    url = _V_PARAM_FIRST_ALONE.sub("", url)
-    return url
+    match = _V_PARAM_VALUE_RE.search(url)
+    if not match:
+        # URL firmada pero sin `v` (p.ej. ya pasada por aqui): nada que mover.
+        return url
+    version = match.group(1)
+    # Quitar el `v` del query, preservando los X-Amz-* byte-a-byte.
+    cleaned = _V_PARAM_NOT_FIRST.sub("", url)            # caso real: `...&v=123`
+    cleaned = _V_PARAM_FIRST_WITH_REST.sub("?", cleaned)  # defensivo: `?v=123&...`
+    cleaned = _V_PARAM_FIRST_ALONE.sub("", cleaned)       # defensivo: `?v=123`
+    # Re-adjuntar como fragmento (no transmitido al servidor).
+    return f"{cleaned}#v={version}"
 
 
 # Lista blanca de campos que un usuario normal puede modificar via PATCH
@@ -287,12 +304,15 @@ class SecurityHardeningConfig(AppConfig):
         SignatureDoesNotMatch -> HTTP 403 en web y en la app movil. La foto no se
         muestra. Verificado con curl: misma firma y ventana, quitando `&v=` -> 200.
 
-        Este patch envuelve `_get_profile_image_urls` y elimina `v` SOLO de las
-        URLs que ya vienen firmadas (contienen `X-Amz-Signature`). Las URLs no
-        firmadas (bucket publico) conservan su cache-buster. Se parchea el helper
-        interno (no el publico `get_profile_image_urls_for_user`) porque este lo
-        invoca via global del modulo, asi el patch surte efecto sin importar como
-        se haya importado la funcion publica en los callers.
+        Este patch envuelve `_get_profile_image_urls` y mueve `v` a un fragmento
+        `#v=` SOLO en las URLs ya firmadas (contienen `X-Amz-Signature`). El
+        fragmento no se envia al servidor (la firma queda valida) pero el cliente
+        lo usa como cache-buster: sin el, como el nombre del objeto es estable por
+        usuario, la app mostraria la foto vieja cacheada tras subir una nueva.
+        Las URLs no firmadas (bucket publico) conservan su `?v=` original. Se
+        parchea el helper interno (no el publico `get_profile_image_urls_for_user`)
+        porque este lo invoca via global del modulo, asi el patch surte efecto sin
+        importar como se haya importado la funcion publica en los callers.
         """
         if SecurityHardeningConfig._patched_profile_image:
             return
@@ -323,14 +343,14 @@ class SecurityHardeningConfig(AppConfig):
             try:
                 if isinstance(urls, dict):
                     return {
-                        size: _strip_version_param_if_signed(url)
+                        size: _relocate_version_to_fragment_if_signed(url)
                         for size, url in urls.items()
                     }
             except Exception:
                 # Nunca rompemos el flujo si algo del patch falla: devolvemos
                 # las URLs originales.
                 logger.exception(
-                    "[SecurityHardening] Error al limpiar el parametro v de las "
+                    "[SecurityHardening] Error al reubicar el parametro v de las "
                     "URLs de profile image - fallback a las URLs originales"
                 )
             return urls
@@ -339,6 +359,7 @@ class SecurityHardeningConfig(AppConfig):
         image_helpers._get_profile_image_urls = signed_safe_get_profile_image_urls
         SecurityHardeningConfig._patched_profile_image = True
         logger.info(
-            "[SecurityHardening] Patch aplicado a _get_profile_image_urls: se "
-            "elimina el cache-buster `v` de las URLs prefirmadas S3v4 (#5)."
+            "[SecurityHardening] Patch aplicado a _get_profile_image_urls: el "
+            "cache-buster `v` se mueve a un fragmento `#v=` en las URLs "
+            "prefirmadas S3v4 (#5)."
         )

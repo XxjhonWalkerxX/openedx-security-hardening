@@ -18,11 +18,13 @@ Vulnerabilidades cubiertas:
   #5 - Imagenes de perfil accesibles sin autenticacion (Camino A:
        bucket privado MinIO con URLs firmadas). El aislamiento del
        bucket vive en el plugin de Tutor minio_profile_isolation; este
-       plugin agrega el patch que quita el cache-buster `v` de las URLs
-       firmadas (sin el, MinIO devuelve 403 SignatureDoesNotMatch).
+       plugin agrega el patch que mueve el cache-buster `v` de las URLs
+       firmadas a un fragmento `#v=` (en el query rompia la firma -> MinIO
+       403 SignatureDoesNotMatch; en el fragmento no se envia al servidor
+       y ademas sirve de cache-buster para el cliente).
 
 Vulnerabilidades NO cubiertas por este plugin:
   #2 - Bypass SSL Pinning  -> se resuelve en el cliente Android
 """
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
