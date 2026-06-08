@@ -15,11 +15,16 @@ Vulnerabilidades cubiertas:
   #3 - Asignacion masiva de parametros (defensa en profundidad)
   #4 - Activacion de cuentas sin necesidad de correo (solo en
        Tutor < 21.0.4 que no incluye el fix upstream ad342ae)
+  #5 - Imagenes de perfil accesibles sin autenticacion (Camino A:
+       bucket privado MinIO con URLs firmadas). El aislamiento del
+       bucket vive en el plugin de Tutor minio_profile_isolation; este
+       plugin agrega el patch que mueve el cache-buster `v` de las URLs
+       firmadas a un fragmento `#v=` (en el query rompia la firma -> MinIO
+       403 SignatureDoesNotMatch; en el fragmento no se envia al servidor
+       y ademas sirve de cache-buster para el cliente).
 
 Vulnerabilidades NO cubiertas por este plugin:
   #2 - Bypass SSL Pinning  -> se resuelve en el cliente Android
-  #5 - Imagenes de perfil  -> se resuelve cambiando la politica del
-                              bucket MinIO/S3 que sirve los archivos
 """
 
-__version__ = "1.0.5"
+__version__ = "1.0.7"

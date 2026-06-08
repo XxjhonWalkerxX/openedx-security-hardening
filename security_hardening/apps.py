@@ -5,6 +5,11 @@ AppConfig que aplica los monkey-patches del plugin de hardening:
    mass assignment (#3 del dictamen TICDEFENSE).
 2. Patch a `AccessTokenView.dispatch` para agregar un rate-limit por
    username en /oauth2/access_token (#1 del dictamen, parte OAuth2).
+3. Patch a `_get_profile_image_urls` para mover el cache-buster `v` de
+   las URLs de foto de perfil ya firmadas (S3v4) a un fragmento `#v=`,
+   que rompia la firma contra MinIO si iba en el query (#5 del dictamen,
+   Camino A: bucket privado). El fragmento no se envia al servidor pero
+   el cliente lo usa para invalidar su cache al cambiar la foto.
 
 Notas:
 - Open edX upstream YA bloquea campos del sistema (is_staff, is_superuser,
@@ -15,10 +20,57 @@ Notas:
 - Intentos rechazados se registran en log para evidencia/auditoria.
 """
 import logging
+import re
 
 from django.apps import AppConfig
 
 logger = logging.getLogger(__name__)
+
+
+# --- Helpers para el patch #5 (cache-buster v en URLs firmadas) ---------------
+#
+# edx-platform agrega `&v=<profile_image_uploaded_at>` al final de la URL de la
+# foto de perfil DESPUES de que django-storages la firma (SigV4). Con un bucket
+# privado (`querystring_auth=True`) ese parametro queda FUERA de la firma: AWS S3
+# poda el query no firmado antes de validar, pero MinIO no -> recalcula la firma
+# incluyendo `v` -> SignatureDoesNotMatch -> HTTP 403 en todos los clientes.
+#
+# NO basta con borrar el `v`: el nombre del objeto en Open edX es estable por
+# usuario (`<hash>_<size>.jpg`), asi que sin un token que cambie al subir una
+# foto nueva, los clientes (la app Android con Coil, sobre todo) mostrarian la
+# foto vieja cacheada. Por eso MOVEMOS el `v` del query a un FRAGMENTO (#v=...):
+# el fragmento no viaja en la peticion HTTP (MinIO valida la firma sin el extra),
+# pero el cliente SI lo ve en la URL y lo usa como cache-buster.
+#
+# Estas regex quitan el `v` del query preservando el resto byte-a-byte (sin
+# re-encodear los `X-Amz-*`, para no invalidar la firma).
+_V_PARAM_VALUE_RE = re.compile(r"[?&]v=([^&#]*)")
+_V_PARAM_NOT_FIRST = re.compile(r"&v=[^&]*")
+_V_PARAM_FIRST_WITH_REST = re.compile(r"\?v=[^&]*&")
+_V_PARAM_FIRST_ALONE = re.compile(r"\?v=[^&]*$")
+
+
+def _relocate_version_to_fragment_if_signed(url):
+    """
+    En URLs ya firmadas (contienen `X-Amz-Signature`), MUEVE el cache-buster `v`
+    del query a un fragmento `#v=...`. MinIO valida la firma sin el parametro
+    extra (el fragmento no se envia en la peticion) y el cliente conserva el
+    token para invalidar su cache al cambiar la foto. Las URLs no firmadas
+    (bucket publico) se devuelven intactas, con su `?v=` original.
+    """
+    if not isinstance(url, str) or "X-Amz-Signature" not in url:
+        return url
+    match = _V_PARAM_VALUE_RE.search(url)
+    if not match:
+        # URL firmada pero sin `v` (p.ej. ya pasada por aqui): nada que mover.
+        return url
+    version = match.group(1)
+    # Quitar el `v` del query, preservando los X-Amz-* byte-a-byte.
+    cleaned = _V_PARAM_NOT_FIRST.sub("", url)            # caso real: `...&v=123`
+    cleaned = _V_PARAM_FIRST_WITH_REST.sub("?", cleaned)  # defensivo: `?v=123&...`
+    cleaned = _V_PARAM_FIRST_ALONE.sub("", cleaned)       # defensivo: `?v=123`
+    # Re-adjuntar como fragmento (no transmitido al servidor).
+    return f"{cleaned}#v={version}"
 
 
 # Lista blanca de campos que un usuario normal puede modificar via PATCH
@@ -57,6 +109,7 @@ class SecurityHardeningConfig(AppConfig):
     verbose_name = "Open edX Security Hardening"
     _patched_account = False
     _patched_oauth2 = False
+    _patched_profile_image = False
 
     def ready(self):
         try:
@@ -70,6 +123,12 @@ class SecurityHardeningConfig(AppConfig):
         except Exception:
             logger.exception(
                 "[SecurityHardening] Error al aplicar patch de oauth2 ratelimit"
+            )
+        try:
+            self._patch_profile_image_signed_urls()
+        except Exception:
+            logger.exception(
+                "[SecurityHardening] Error al aplicar patch de profile image signed urls"
             )
 
     def _patch_update_account_settings(self):
@@ -229,4 +288,78 @@ class SecurityHardeningConfig(AppConfig):
             "[SecurityHardening] Rate-limit por username aplicado a "
             "/oauth2/access_token: %s",
             rate,
+        )
+
+    def _patch_profile_image_signed_urls(self):
+        """
+        Quita el cache-buster `v` que edx-platform agrega a las URLs de foto de
+        perfil DESPUES de firmarlas (SigV4), y que rompia la firma contra MinIO.
+
+        Contexto (#5, Camino A): las fotos de perfil se aislaron en un bucket
+        privado MinIO (`openedxprofiles`) con `querystring_auth=True`, asi que la
+        API entrega URLs prefirmadas S3v4. Pero `image_helpers._get_profile_image_urls`
+        agrega `&v=<profile_image_uploaded_at>` al final de la URL ya firmada. Ese
+        parametro queda FUERA de la firma: AWS S3 poda el query no firmado antes
+        de validar, pero MinIO no -> recalcula la firma incluyendo `v` ->
+        SignatureDoesNotMatch -> HTTP 403 en web y en la app movil. La foto no se
+        muestra. Verificado con curl: misma firma y ventana, quitando `&v=` -> 200.
+
+        Este patch envuelve `_get_profile_image_urls` y mueve `v` a un fragmento
+        `#v=` SOLO en las URLs ya firmadas (contienen `X-Amz-Signature`). El
+        fragmento no se envia al servidor (la firma queda valida) pero el cliente
+        lo usa como cache-buster: sin el, como el nombre del objeto es estable por
+        usuario, la app mostraria la foto vieja cacheada tras subir una nueva.
+        Las URLs no firmadas (bucket publico) conservan su `?v=` original. Se
+        parchea el helper interno (no el publico `get_profile_image_urls_for_user`)
+        porque este lo invoca via global del modulo, asi el patch surte efecto sin
+        importar como se haya importado la funcion publica en los callers.
+        """
+        if SecurityHardeningConfig._patched_profile_image:
+            return
+
+        try:
+            from openedx.core.djangoapps.user_api.accounts import image_helpers
+        except ImportError:
+            logger.warning(
+                "[SecurityHardening] No se pudo importar accounts.image_helpers - "
+                "patch de profile image NO aplicado"
+            )
+            return
+
+        original_get_urls = getattr(image_helpers, "_get_profile_image_urls", None)
+        if original_get_urls is None:
+            logger.warning(
+                "[SecurityHardening] _get_profile_image_urls no encontrada en "
+                "image_helpers - patch de profile image NO aplicado"
+            )
+            return
+
+        if getattr(original_get_urls, "_security_hardening_patched", False):
+            SecurityHardeningConfig._patched_profile_image = True
+            return
+
+        def signed_safe_get_profile_image_urls(*args, **kwargs):
+            urls = original_get_urls(*args, **kwargs)
+            try:
+                if isinstance(urls, dict):
+                    return {
+                        size: _relocate_version_to_fragment_if_signed(url)
+                        for size, url in urls.items()
+                    }
+            except Exception:
+                # Nunca rompemos el flujo si algo del patch falla: devolvemos
+                # las URLs originales.
+                logger.exception(
+                    "[SecurityHardening] Error al reubicar el parametro v de las "
+                    "URLs de profile image - fallback a las URLs originales"
+                )
+            return urls
+
+        signed_safe_get_profile_image_urls._security_hardening_patched = True
+        image_helpers._get_profile_image_urls = signed_safe_get_profile_image_urls
+        SecurityHardeningConfig._patched_profile_image = True
+        logger.info(
+            "[SecurityHardening] Patch aplicado a _get_profile_image_urls: el "
+            "cache-buster `v` se mueve a un fragmento `#v=` en las URLs "
+            "prefirmadas S3v4 (#5)."
         )
